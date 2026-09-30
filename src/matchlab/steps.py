@@ -436,7 +436,7 @@ class Step(ABC):
 
         if store.has(fp):  # cache hit, skip the work entirely
             if fp != self._fp and hasattr(self, "_prepared"):
-                self._prepared = False
+                self._prepared = None
             self._fp = fp
             return StepStatus.CACHED
 

@@ -5,7 +5,7 @@ from typing import ClassVar
 
 import duckdb
 import polars as pl
-from pydantic import Field, PrivateAttr, field_validator
+from pydantic import Field, field_validator
 
 from matchlab.core.logging import logger
 from matchlab.core.sql import SQLCondition, SQLQuery
@@ -74,9 +74,6 @@ class DeterministicLinker(Linker):
         """,
     )
 
-    _baseline_left: pl.DataFrame | None = PrivateAttr(default=None)
-    _baseline_right: pl.DataFrame | None = PrivateAttr(default=None)
-
     @field_validator("comparisons", mode="before")
     @classmethod
     def validate_comparison(
@@ -100,29 +97,28 @@ class DeterministicLinker(Linker):
             "comparisons must be a string, list of strings, or list of lists"
         )
 
-    def prepare(self, left: pl.DataFrame, right: pl.DataFrame) -> None:
-        """Keep both inputs for later affected-side calls."""
-        self._baseline_left = left.clone()
-        self._baseline_right = right.clone()
-
     def link(
-        self, left: pl.DataFrame | None = None, right: pl.DataFrame | None = None
+        self,
+        prepared_state: object,
+        left: pl.DataFrame | None = None,
+        right: pl.DataFrame | None = None,
+        *,
+        baseline_left: pl.DataFrame,
+        baseline_right: pl.DataFrame,
     ) -> pl.DataFrame:
         """Link supplied additions against the prepared baseline and each other.
 
         Sequential rounds share one call, so earlier matches leave the pool
         before later rounds run.
         """
-        if self._baseline_left is None or self._baseline_right is None:
-            raise RuntimeError("Call prepare() before link()")
         if left is None and right is None:
             raise ValueError("Provide at least one affected side to link()")
 
         con: duckdb.DuckDBPyConnection = duckdb.connect(":memory:")
         try:
             all_matches: list[pl.DataFrame] = []
-            remaining_left = _combine_input(self._baseline_left, left)
-            remaining_right = _combine_input(self._baseline_right, right)
+            remaining_left = _combine_input(baseline_left, left)
+            remaining_right = _combine_input(baseline_right, right)
 
             for round_num, round_comparisons in enumerate(self.comparisons, start=1):
                 if remaining_left.is_empty() or remaining_right.is_empty():
@@ -157,7 +153,11 @@ class DeterministicLinker(Linker):
                         how="anti",
                     )
 
-            return self._finalise_results(all_matches)
+            return self._finalise_results(
+                all_matches,
+                baseline_left[self.left_id].dtype,
+                baseline_right[self.right_id].dtype,
+            )
         finally:
             con.close()
 
@@ -247,14 +247,19 @@ class DeterministicLinker(Linker):
             estimates.extend(self._traverse_plan(child, plan_type, depth + 1))
         return estimates
 
-    def _finalise_results(self, all_matches: list[pl.DataFrame]) -> pl.DataFrame:
+    def _finalise_results(
+        self,
+        all_matches: list[pl.DataFrame],
+        left_id_dtype: pl.DataType,
+        right_id_dtype: pl.DataType,
+    ) -> pl.DataFrame:
         """Combine matches from all rounds and ensure correct schema."""
         if all_matches:
             return pl.concat(all_matches).with_columns(pl.col("score").cast(pl.Float32))
         return pl.DataFrame(
             schema={
-                "left_id": self._baseline_left[self.left_id].dtype,
-                "right_id": self._baseline_right[self.right_id].dtype,
+                "left_id": left_id_dtype,
+                "right_id": right_id_dtype,
                 "score": pl.Float32,
             }
         )

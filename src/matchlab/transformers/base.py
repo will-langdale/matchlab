@@ -11,7 +11,7 @@ callables, exactly as a `Deduper`'s settings are.
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import duckdb
 import polars as pl
@@ -42,15 +42,40 @@ class Transformer(BaseModel, ABC):
     # See `matchlab.core.versioning`.
     version: ClassVar[int | None] = None
 
-    @abstractmethod
-    def prepare(self, data: pl.DataFrame) -> None:
-        """Prepare reusable state from the complete input to this transform."""
-        ...
+    def prepare(self, data: pl.DataFrame) -> "PreparedTransformer":
+        """Return runtime preparation from the full baseline without changing self.
+
+        Override this to return derived state; the default needs no setup.
+        """
+        return PreparedTransformer(methodology=self)
 
     @abstractmethod
-    def apply(self, data: pl.DataFrame) -> pl.DataFrame:
+    def apply(
+        self,
+        prepared_state: Any,  # noqa: ANN401 - opaque state owned by the author
+        data: pl.DataFrame,
+        *,
+        baseline: pl.DataFrame,
+    ) -> pl.DataFrame:
         """Reshape supplied data using prepared state, preserving `id`."""
         ...
+
+
+class PreparedTransformer(BaseModel):
+    """In-memory preparation for one Transformer, independent of its specification.
+
+    State can contain arbitrary backend objects and need not be serialisable.
+    Baseline data is supplied explicitly to each action by the caller.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
+
+    methodology: Transformer
+    state: Any = None
+
+    def apply(self, data: pl.DataFrame, *, baseline: pl.DataFrame) -> pl.DataFrame:
+        """Reshape supplied rows using this preparation and the explicit baseline."""
+        return self.methodology.apply(self.state, data, baseline=baseline)
 
 
 def reject_id_output(names: Iterable[str]) -> None:

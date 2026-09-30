@@ -6,10 +6,11 @@ fixture but never collect. The identities hold before any warehouse read.
 
 from collections.abc import Callable
 from typing import ClassVar
+from unittest.mock import patch
 
 import polars as pl
 import pytest
-from pydantic import PrivateAttr, ValidationError
+from pydantic import ValidationError
 
 from matchlab import Source
 from matchlab.stores import DuckDBStore
@@ -77,10 +78,9 @@ class _Double(Transformer):
 
     column: str
 
-    def prepare(self, data: pl.DataFrame) -> None:
-        """No baseline state is needed."""
-
-    def apply(self, data: pl.DataFrame) -> pl.DataFrame:
+    def apply(
+        self, prepared_state: object, data: pl.DataFrame, *, baseline: pl.DataFrame
+    ) -> pl.DataFrame:
         return data.with_columns((pl.col(self.column) * 2).alias(self.column))
 
 
@@ -94,7 +94,9 @@ def test_add_transformer_class_makes_it_nameable(
     step = Transform(crn, "_Double", {"column": "n"})
 
     assert isinstance(step.transformer, _Double)
-    assert step.transformer.apply(pl.DataFrame({"n": [1, 2]}))["n"].to_list() == [2, 4]
+    assert step.transformer.prepare(pl.DataFrame({"n": [1, 2]})).apply(
+        pl.DataFrame({"n": [1, 2]}), baseline=pl.DataFrame({"n": [1, 2]})
+    )["n"].to_list() == [2, 4]
 
 
 def test_add_transformer_class_rejects_non_transformer() -> None:
@@ -104,18 +106,11 @@ def test_add_transformer_class_rejects_non_transformer() -> None:
 
 
 class _Counting(Transformer):
-    """A transformer whose private state exposes preparation to its tests."""
+    """An identity transformer for runtime preparation lifecycle tests."""
 
-    _calls: int = PrivateAttr(default=0)
-    _fail_once: bool = PrivateAttr(default=False)
-
-    def prepare(self, data: pl.DataFrame) -> None:
-        self._calls += 1
-        if self._fail_once:
-            self._fail_once = False
-            raise ValueError("baseline unavailable")
-
-    def apply(self, data: pl.DataFrame) -> pl.DataFrame:
+    def apply(
+        self, prepared_state: object, data: pl.DataFrame, *, baseline: pl.DataFrame
+    ) -> pl.DataFrame:
         return data
 
 
@@ -126,48 +121,71 @@ class _CachedCounting(_Counting):
 
 
 def test_transformer_instance_isolated(source: Callable[..., Source]) -> None:
-    """Each step owns its runtime state, even when built from one prepared value."""
+    """Each step starts without preparation even when given the same specification."""
     transformer = _Counting()
-    transformer.prepare(pl.DataFrame())
+    prepared = transformer.prepare(pl.DataFrame())
     crn = source("crn")
     first = crn.transform(transformer)
     second = crn.transform(transformer)
 
     assert first.transformer is not transformer
     assert first.transformer is not second.transformer
-    assert first.transformer._calls == second.transformer._calls == 0
+    assert first._prepared is second._prepared is None
     first.collect()
-    assert first.transformer._calls == 1
-    assert second.transformer._calls == 0
+    assert first._prepared is not None
+    assert first._prepared is not prepared
+    assert second._prepared is None
 
 
 def test_prepare_cache_retry(source: Callable[..., Source]) -> None:
-    """A failed lazy prepare raises, then a later call can retry the same baseline."""
+    """A failed lazy preparation can retry against the same collected baseline."""
     crn = source("crn")
     crn.transform(_CachedCounting()).collect()
     cached = crn.transform(_CachedCounting()).collect()
-    cached.transformer._fail_once = True
+    prepared = cached.transformer.prepare(crn._read_cache(cached._require_store()))
 
-    with pytest.raises(ValueError, match="baseline unavailable"):
-        cached._ensure_prepared()
-    assert not cached._prepared
-
-    cached._ensure_prepared()
-    assert cached.transformer._calls == 2
-    assert cached._prepared
+    with patch.object(
+        _CachedCounting,
+        "prepare",
+        side_effect=[ValueError("baseline unavailable"), prepared],
+    ) as prepare:
+        with pytest.raises(ValueError, match="baseline unavailable"):
+            cached._ensure_prepared()
+        assert cached._prepared is None
+        assert cached._ensure_prepared() is prepared
+        assert cached._ensure_prepared() is prepared
+        assert prepare.call_count == 2
 
 
 def test_prepare_refresh(source: Callable[..., Source]) -> None:
-    """A refreshed unversioned transform prepares again on its current input."""
+    """Refreshing an unversioned transform replaces its prepared object."""
     step = source("crn").transform(_Counting())
     step.collect()
+    first = step._prepared
     step.collect()
 
-    assert step.transformer._calls == 2
+    assert step._prepared is not None
+    assert step._prepared is not first
+
+
+def test_prepare_invalidated_on_different_cached_output(
+    source: Callable[..., Source],
+) -> None:
+    """Adopting another cached fingerprint drops the previous runtime preparation."""
+    crn = source("crn")
+    first = crn.transform(_Counting()).collect()
+    second = crn.transform(_Counting()).collect()
+    assert first._fp != second._fp
+    assert first._prepared is not None
+    with patch.object(Transform, "_fingerprint", return_value=second._fp):
+        first.collect()
+    assert first._fp == second._fp
+    assert first._prepared is None
+    assert first._ensure_prepared() is not second._prepared
 
 
 def test_prepare_uncollected(source: Callable[..., Source]) -> None:
-    """Runtime preparation cannot use a plan that has no collected baseline."""
+    """Runtime preparation requires a collected baseline."""
     step = source("crn").transform(_Counting())
     with pytest.raises(RuntimeError, match="Call collect"):
         step._ensure_prepared()
@@ -239,10 +257,9 @@ def test_custom_transformer_id_replaced(
     """
 
     class ClobbersId(Transformer):
-        def prepare(self, data: pl.DataFrame) -> None:
-            """No baseline state is needed."""
-
-        def apply(self, data: pl.DataFrame) -> pl.DataFrame:
+        def apply(
+            self, prepared_state: object, data: pl.DataFrame, *, baseline: pl.DataFrame
+        ) -> pl.DataFrame:
             return data.with_columns(pl.col("crn_company").alias("id"))
 
     step = source("crn").transform(ClobbersId())
@@ -256,10 +273,9 @@ def test_custom_transformer_id_drop(
     """Losing `id` altogether is the same failure, one step earlier."""
 
     class DropsId(Transformer):
-        def prepare(self, data: pl.DataFrame) -> None:
-            """No baseline state is needed."""
-
-        def apply(self, data: pl.DataFrame) -> pl.DataFrame:
+        def apply(
+            self, prepared_state: object, data: pl.DataFrame, *, baseline: pl.DataFrame
+        ) -> pl.DataFrame:
             return data.drop("id")
 
     step = source("crn").transform(DropsId())

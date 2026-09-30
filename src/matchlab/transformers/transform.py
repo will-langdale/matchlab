@@ -15,7 +15,7 @@ from matchlab.recordstep import IdentifierRead, RecordStep
 from matchlab.resources import Resource
 from matchlab.specs import TransformSpec
 from matchlab.stores import Fingerprint, Store
-from matchlab.transformers.base import Transformer
+from matchlab.transformers.base import PreparedTransformer, Transformer
 from matchlab.transformers.clean import Clean
 from matchlab.transformers.explode import Explode
 from matchlab.transformers.group import Group
@@ -45,6 +45,7 @@ class Transform(RecordStep):
     )
 
     # Settled at construction. See `Step.parents` for why this is declared.
+    _prepared: PreparedTransformer | None
     transformer: Transformer
     transformer_settings: dict[str, Any]
     transformer_resources: dict[str, Resource]
@@ -104,7 +105,7 @@ class Transform(RecordStep):
             transformer_settings=settings,
             transformer_resources=resources,
         )
-        self._prepared = False
+        self._prepared = None
         self._check_names()
 
     # Settled at construction. The record step this transform reshapes.
@@ -140,10 +141,10 @@ class Transform(RecordStep):
 
     def _execute(self, store: Store, fp: Fingerprint) -> None:
         records = self._input._read_cache(store)
-        self._prepared = False
-        self.transformer.prepare(records)
-        self._prepared = True
-        reshaped = self.transformer.apply(records)
+        self._prepared = None
+        prepared = self.transformer.prepare(records)
+        self._prepared = prepared
+        reshaped = prepared.apply(records, baseline=records)
 
         # The built-ins refuse an `id` output when they are built. This catches a custom
         # transformer that writes one anyway.
@@ -162,13 +163,14 @@ class Transform(RecordStep):
 
         store.store_transform(fp, reshaped)
 
-    def _ensure_prepared(self) -> None:
+    def _ensure_prepared(self) -> PreparedTransformer:
         """Prepare from the collected input when collection used a cached artifact."""
         store = self._require_store()
-        if self._prepared:
-            return
-        self.transformer.prepare(self._input._read_cache(store))
-        self._prepared = True
+        if self._prepared is not None:
+            return self._prepared
+        prepared = self.transformer.prepare(self._input._read_cache(store))
+        self._prepared = prepared
+        return prepared
 
     # -- RecordStep contract ------------------------------------------------------
 

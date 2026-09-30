@@ -32,12 +32,12 @@ class Components(ResolverMethod):
         ),
     )
 
-    def prepare(self, model_edges: Mapping[int, pl.DataFrame]) -> None:
-        """This method needs no baseline state."""
-
     def compute_clusters(  # noqa: D102
         self,
+        prepared_state: object,
         model_edges: Mapping[int, pl.DataFrame],
+        *,
+        baseline_model_edges: Mapping[int, pl.DataFrame],
     ) -> pl.DataFrame:
         filtered = [
             edges_item.filter(pl.col("score") >= self.thresholds.get(position, 0.0))

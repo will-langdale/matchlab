@@ -61,10 +61,12 @@ def test_splink_affected(
     """Score each supplied side against both the baseline and supplied opposite."""
     left, right = splink_inputs
     linker = make_linker()
-    linker.prepare(left, right)
-    result = linker.link(
+    prepared = linker.prepare(left, right)
+    result = prepared.link(
         left=left.head(1) if affected_left else None,
         right=right.head(1) if affected_right else None,
+        baseline_left=left,
+        baseline_right=right,
     )
     assert set(result.select("left_id", "right_id").rows()) == expected_pairs
     assert result.height == len(expected_pairs)
@@ -74,14 +76,16 @@ def test_splink_baseline(splink_inputs: tuple[pl.DataFrame, pl.DataFrame]) -> No
     """Full inputs still score the whole collection after an affected prediction."""
     left, right = splink_inputs
     linker = make_linker()
-    linker.prepare(left, right)
-    linker.link(left.head(1), right.head(1))
+    prepared = linker.prepare(left, right)
+    prepared.link(left.head(1), right.head(1), baseline_left=left, baseline_right=right)
     with patch.object(
-        linker._linker.inference,
+        prepared.state.inference,
         "predict",
-        wraps=linker._linker.inference.predict,
+        wraps=prepared.state.inference.predict,
     ) as predict:
-        result = linker.link(left.clone(), right.clone())
+        result = prepared.link(
+            left.clone(), right.clone(), baseline_left=left, baseline_right=right
+        )
     assert predict.call_count == 1
     assert set(result.select("left_id", "right_id").rows()) == {
         (1, 4),
@@ -99,8 +103,8 @@ def test_splink_baseline_changed_rows(
     """A changed row with an existing ID must contribute its new score."""
     left, right = splink_inputs
     linker = make_linker()
-    linker.prepare(left, right)
-    baseline = linker.link(left, right)
+    prepared = linker.prepare(left, right)
+    baseline = prepared.link(left, right, baseline_left=left, baseline_right=right)
     changed_right = right.with_columns(
         pl.when(pl.col("id") == 4)
         .then(pl.lit("B"))
@@ -108,7 +112,9 @@ def test_splink_baseline_changed_rows(
         .alias("city")
     )
 
-    result = linker.link(left, changed_right)
+    result = prepared.link(
+        left, changed_right, baseline_left=left, baseline_right=right
+    )
     baseline_score = baseline.filter(pl.col("left_id") == 3, pl.col("right_id") == 4)[
         "score"
     ].item()
@@ -127,8 +133,10 @@ def test_splink_baseline_alternating_sides(
     """Alternating affected sides must not leave stale tables or term frequencies."""
     left, right = splink_inputs
     linker = make_linker()
-    linker.prepare(left, right)
-    baseline = linker.link(left, right).sort("left_id", "right_id")
+    prepared = linker.prepare(left, right)
+    baseline = prepared.link(
+        left, right, baseline_left=left, baseline_right=right
+    ).sort("left_id", "right_id")
 
     cases = [
         (left.head(1), None, baseline.filter(pl.col("left_id") == 1)),
@@ -145,13 +153,19 @@ def test_splink_baseline_alternating_sides(
     ]
     for affected_left, affected_right, expected in cases:
         assert_frame_equal(
-            linker.link(left=affected_left, right=affected_right).sort(
-                "left_id", "right_id"
-            ),
+            prepared.link(
+                left=affected_left,
+                right=affected_right,
+                baseline_left=left,
+                baseline_right=right,
+            ).sort("left_id", "right_id"),
             expected,
         )
         assert_frame_equal(
-            linker.link(left, right).sort("left_id", "right_id"), baseline
+            prepared.link(left, right, baseline_left=left, baseline_right=right).sort(
+                "left_id", "right_id"
+            ),
+            baseline,
         )
 
 
@@ -161,16 +175,63 @@ def test_splink_term_frequencies(
     """A first preview uses frequencies from the prepared inputs."""
     left, right = splink_inputs
     linker = make_linker()
-    linker.prepare(left, right)
-    affected = linker.link(left.head(1), right.head(1)).filter(
-        pl.col("left_id") == 1, pl.col("right_id") == 4
-    )
+    prepared = linker.prepare(left, right)
+    affected = prepared.link(
+        left.head(1), right.head(1), baseline_left=left, baseline_right=right
+    ).filter(pl.col("left_id") == 1, pl.col("right_id") == 4)
     baseline_linker = make_linker()
-    baseline_linker.prepare(left, right)
-    baseline = baseline_linker.link(left, right).filter(
-        pl.col("left_id") == 1, pl.col("right_id") == 4
-    )
+    baseline_linker_prepared = baseline_linker.prepare(left, right)
+    baseline = baseline_linker_prepared.link(
+        left, right, baseline_left=left, baseline_right=right
+    ).filter(pl.col("left_id") == 1, pl.col("right_id") == 4)
     assert affected["score"].to_list() == baseline["score"].to_list()
+
+
+def test_splink_preparations_are_independent(
+    splink_inputs: tuple[pl.DataFrame, pl.DataFrame],
+) -> None:
+    """A second preparation cannot replace the first backend's term frequencies."""
+    left, right = splink_inputs
+    linker = make_linker()
+    settings = linker.model_dump_json()
+    original_left, original_right = left.clone(), right.clone()
+    first = linker.prepare(left, right)
+    expected = first.link(
+        left.head(1), right.head(1), baseline_left=left, baseline_right=right
+    ).sort("left_id", "right_id")
+    other_left, other_right = left.head(1), right.head(1)
+    second = linker.prepare(other_left, other_right)
+    alternate = second.link(
+        other_left,
+        other_right,
+        baseline_left=other_left,
+        baseline_right=other_right,
+    )
+    first_score = expected.filter(pl.col("left_id") == 1, pl.col("right_id") == 4)[
+        "score"
+    ].item()
+    assert alternate["score"].item() != first_score
+    assert first.state is not second.state
+    for _ in range(2):
+        assert_frame_equal(
+            first.link(
+                left.head(1), right.head(1), baseline_left=left, baseline_right=right
+            ).sort("left_id", "right_id"),
+            expected,
+        )
+        assert_frame_equal(
+            second.link(
+                other_left,
+                other_right,
+                baseline_left=other_left,
+                baseline_right=other_right,
+            ),
+            alternate,
+        )
+    assert_frame_equal(left, original_left)
+    assert_frame_equal(right, original_right)
+    assert linker.model_dump_json() == settings
+    assert not linker.__pydantic_private__
 
 
 def test_splink_additions_preserve_baselines(
@@ -179,12 +240,16 @@ def test_splink_additions_preserve_baselines(
     """New rows link across all three pairings without adding baseline-only edges."""
     left, right = splink_inputs
     linker = make_linker()
-    linker.prepare(left, right)
-    baseline = linker.link(left, right).sort("left_id", "right_id")
+    prepared = linker.prepare(left, right)
+    baseline = prepared.link(
+        left, right, baseline_left=left, baseline_right=right
+    ).sort("left_id", "right_id")
     new_left = pl.DataFrame({"id": [7], "name": ["alice"], "city": ["A"]})
     new_right = pl.DataFrame({"id": [8], "name": ["alice"], "city": ["B"]})
 
-    result = linker.link(new_left, new_right)
+    result = prepared.link(
+        new_left, new_right, baseline_left=left, baseline_right=right
+    )
     affected_left_to_baseline_right = {(7, 4), (7, 5)}
     baseline_left_to_affected_right = {(1, 8), (3, 8)}
     affected_to_affected = {(7, 8)}
@@ -208,12 +273,25 @@ def test_splink_additions_preserve_baselines(
     assert score_by_pair[7, 4] == baseline_scores[1, 4]
     assert score_by_pair[1, 8] == baseline_scores[1, 5]
     assert score_by_pair[7, 8] == baseline_scores[1, 5]
-    assert_frame_equal(linker.link(left, right).sort("left_id", "right_id"), baseline)
-    assert set(linker.link(new_left).select("left_id", "right_id").rows()) == {
+    assert_frame_equal(
+        prepared.link(left, right, baseline_left=left, baseline_right=right).sort(
+            "left_id", "right_id"
+        ),
+        baseline,
+    )
+    assert set(
+        prepared.link(new_left, baseline_left=left, baseline_right=right)
+        .select("left_id", "right_id")
+        .rows()
+    ) == {
         (7, 4),
         (7, 5),
     }
-    assert set(linker.link(right=new_right).select("left_id", "right_id").rows()) == {
+    assert set(
+        prepared.link(right=new_right, baseline_left=left, baseline_right=right)
+        .select("left_id", "right_id")
+        .rows()
+    ) == {
         (1, 8),
         (3, 8),
     }
@@ -225,7 +303,7 @@ def test_splink_additions_blocked_pairs(
     """The Cartesian comparison of new rows must still obey Splink blocking."""
     left, right = splink_inputs
     linker = make_linker()
-    linker.prepare(left, right)
+    prepared = linker.prepare(left, right)
     new_left = pl.DataFrame(
         {"id": [7, 8], "name": ["alice", "bob"], "city": ["A", "B"]}
     )
@@ -233,7 +311,9 @@ def test_splink_additions_blocked_pairs(
         {"id": [9, 10], "name": ["bob", "alice"], "city": ["B", "A"]}
     )
 
-    result = linker.link(new_left, new_right)
+    result = prepared.link(
+        new_left, new_right, baseline_left=left, baseline_right=right
+    )
     assert set(result.select("left_id", "right_id").rows()) == {
         (7, 4),
         (7, 5),
@@ -261,8 +341,10 @@ def test_splink_threshold(
     """Affected previews retain strong matches and discard weaker ones."""
     left, right = splink_inputs
     linker = make_linker(threshold=threshold)
-    linker.prepare(left, right)
-    result = linker.link(left.head(1), right.head(1))
+    prepared = linker.prepare(left, right)
+    result = prepared.link(
+        left.head(1), right.head(1), baseline_left=left, baseline_right=right
+    )
     assert set(result.select("left_id", "right_id").rows()) == expected_pairs
 
 
@@ -287,9 +369,9 @@ def test_splink_threshold_boundary(
         ),
         threshold=0.5,
     )
-    linker.prepare(left, right)
+    prepared = linker.prepare(left, right)
 
-    result = linker.link(left.head(1))
+    result = prepared.link(left.head(1), baseline_left=left, baseline_right=right)
     assert set(result.select("left_id", "right_id").rows()) == {(1, 4), (1, 5)}
     assert result["score"].to_list() == [0.5, 0.5]
 
@@ -308,14 +390,16 @@ def test_splink_training(splink_inputs: tuple[pl.DataFrame, pl.DataFrame]) -> No
             )
         ]
     )
-    linker.prepare(left, right)
+    prepared = linker.prepare(left, right)
     with patch.object(
         LinkerTraining,
         "estimate_probability_two_random_records_match",
         side_effect=AssertionError("training ran during link"),
     ):
         assert set(
-            linker.link(left.head(1), right.head(1))
+            prepared.link(
+                left.head(1), right.head(1), baseline_left=left, baseline_right=right
+            )
             .select("left_id", "right_id")
             .rows()
         ) == {(1, 4), (1, 5), (3, 4)}
@@ -335,10 +419,12 @@ def test_splink_empty_side(
     """Empty additions do not suppress matches from the other supplied side."""
     left, right = splink_inputs
     linker = make_linker()
-    linker.prepare(left, right)
-    result = linker.link(
+    prepared = linker.prepare(left, right)
+    result = prepared.link(
         left=left.head(0) if side in ("left", "both") else None,
         right=right.head(0) if side in ("right", "both") else None,
+        baseline_left=left,
+        baseline_right=right,
     )
     assert result.schema == {
         "left_id": pl.Int64,
@@ -354,19 +440,26 @@ def test_splink_one_empty_addition(
     """An empty supplied side still scores additions on the other side."""
     left, right = splink_inputs
     linker = make_linker()
-    linker.prepare(left, right)
+    prepared = linker.prepare(left, right)
     assert set(
-        linker.link(left.head(0), right.head(1)).select("left_id", "right_id").rows()
+        prepared.link(
+            left.head(0), right.head(1), baseline_left=left, baseline_right=right
+        )
+        .select("left_id", "right_id")
+        .rows()
     ) == {(1, 4), (3, 4)}
     assert set(
-        linker.link(left.head(1), right.head(0)).select("left_id", "right_id").rows()
+        prepared.link(
+            left.head(1), right.head(0), baseline_left=left, baseline_right=right
+        )
+        .select("left_id", "right_id")
+        .rows()
     ) == {(1, 4), (1, 5)}
 
 
 @pytest.mark.parametrize(
     ("left", "right", "message"),
     [
-        pytest.param(None, None, "Call prepare", id="unprepared"),
         pytest.param(None, None, "at least one affected", id="no_side"),
         pytest.param("bad_schema", None, "conformant", id="left_schema"),
         pytest.param(None, "bad_schema", "conformant", id="right_schema"),
@@ -378,18 +471,19 @@ def test_splink_rejects_inputs(
     right: str | None,
     message: str,
 ) -> None:
-    """Reject calls without preparation, an affected side or matching schemas."""
+    """Reject calls without a supplied side or matching schemas."""
     baseline_left, baseline_right = splink_inputs
     linker = make_linker()
-    if message != "Call prepare":
-        linker.prepare(baseline_left, baseline_right)
+    prepared = linker.prepare(baseline_left, baseline_right)
     replacements = {
         "bad_schema": baseline_left.drop("city"),
     }
     with pytest.raises(ValueError, match=message):
-        linker.link(
+        prepared.link(
             replacements[left] if left is not None else None,
             replacements[right] if right is not None else None,
+            baseline_left=baseline_left,
+            baseline_right=baseline_right,
         )
 
 

@@ -494,14 +494,16 @@ def test_affected_pairs(
     )
     affected_left = pl.DataFrame({"id": [3], "key": ["a"], "fallback": ["a"]})
     affected_right = pl.DataFrame({"id": [30], "key": ["a"], "fallback": ["a"]})
-    linker.prepare(baseline_left, baseline_right)
+    prepared = linker.prepare(baseline_left, baseline_right)
 
     kwargs = {}
     if affected_side in ("left", "both"):
         kwargs["left"] = affected_left
     if affected_side in ("right", "both"):
         kwargs["right"] = affected_right
-    results = linker.link(**kwargs)
+    results = prepared.link(
+        **kwargs, baseline_left=baseline_left, baseline_right=baseline_right
+    )
 
     pairs = set(results.select("left_id", "right_id").iter_rows())
     assert pairs == expected
@@ -536,16 +538,13 @@ def test_affected_pairs(
 def test_affected_rejects_missing_inputs(
     linker_class: type[Linker], settings: dict[str, Any]
 ) -> None:
-    """Linking requires preparation and at least one affected side."""
+    """Linking requires at least one supplied side."""
     linker = linker_class.model_validate(settings)
     data = pl.DataFrame({"id": [1], "key": ["a"]})
 
-    with pytest.raises(RuntimeError, match="prepare"):
-        linker.link(left=data)
-
-    linker.prepare(data, data)
+    prepared = linker.prepare(data, data)
     with pytest.raises(ValueError, match="affected side"):
-        linker.link()
+        prepared.link(baseline_left=data, baseline_right=data)
 
 
 @pytest.mark.parametrize(
@@ -577,13 +576,20 @@ def test_affected_prepared_baseline(
     baseline_right = pl.DataFrame(
         {"id": [10, 20, 30], "key": ["a", "b", "c"], "note": [None, None, None]}
     )
-    linker.prepare(baseline_left, baseline_right)
+    prepared = linker.prepare(baseline_left, baseline_right)
 
-    linker.link(
+    prepared.link(
         left=pl.DataFrame({"id": [3], "key": ["a"], "note": [None]}),
         right=pl.DataFrame({"id": [40], "key": ["a"], "note": [None]}),
+        baseline_left=baseline_left,
+        baseline_right=baseline_right,
     )
-    results = linker.link(left=baseline_left, right=baseline_right)
+    results = prepared.link(
+        left=baseline_left,
+        right=baseline_right,
+        baseline_left=baseline_left,
+        baseline_right=baseline_right,
+    )
 
     assert set(results.iter_rows()) == {
         (1, 10, 1.0),
@@ -616,14 +622,17 @@ def test_affected_same_id_rows(
 ) -> None:
     """Adding one variant of an ID keeps its other baseline variants available."""
     linker = linker_class.model_validate(settings)
-    linker.prepare(
-        pl.DataFrame({"id": [1, 2], "key": ["old", "baseline"]}),
-        pl.DataFrame({"id": [10, 20, 30], "key": ["old", "new", "baseline"]}),
+    baseline_left = pl.DataFrame({"id": [1, 2], "key": ["old", "baseline"]})
+    baseline_right = pl.DataFrame(
+        {"id": [10, 20, 30], "key": ["old", "new", "baseline"]}
     )
+    prepared = linker.prepare(baseline_left, baseline_right)
 
-    results = linker.link(
+    results = prepared.link(
         left=pl.DataFrame({"id": [1], "key": ["new"]}),
         right=pl.DataFrame({"id": [40], "key": ["old"]}),
+        baseline_left=baseline_left,
+        baseline_right=baseline_right,
     )
 
     assert set(results.iter_rows()) == {(1, 20, 1.0), (1, 40, 1.0)}
@@ -641,9 +650,11 @@ def test_affected_sequential_rounds() -> None:
     baseline_right = pl.DataFrame(
         {"id": [10, 20], "key": ["a", "other"], "fallback": ["z", "z"]}
     )
-    linker.prepare(baseline_left, baseline_right)
+    prepared = linker.prepare(baseline_left, baseline_right)
 
-    results = linker.link(left=baseline_left)
+    results = prepared.link(
+        left=baseline_left, baseline_left=baseline_left, baseline_right=baseline_right
+    )
 
     assert set(results.select("left_id", "right_id").iter_rows()) == {
         (1, 10),
@@ -656,14 +667,15 @@ def test_affected_both_sides_share_sequential_rounds() -> None:
     linker = DeterministicLinker(
         comparisons=[["l.key = r.key"], ["l.fallback = r.fallback"]]
     )
-    linker.prepare(
-        pl.DataFrame({"id": [1], "key": ["x"], "fallback": ["z"]}),
-        pl.DataFrame({"id": [10], "key": ["a"], "fallback": ["x"]}),
-    )
+    baseline_left = pl.DataFrame({"id": [1], "key": ["x"], "fallback": ["z"]})
+    baseline_right = pl.DataFrame({"id": [10], "key": ["a"], "fallback": ["x"]})
+    prepared = linker.prepare(baseline_left, baseline_right)
 
-    results = linker.link(
+    results = prepared.link(
         left=pl.DataFrame({"id": [3], "key": ["a"], "fallback": ["z"]}),
         right=pl.DataFrame({"id": [30], "key": ["b"], "fallback": ["z"]}),
+        baseline_left=baseline_left,
+        baseline_right=baseline_right,
     )
 
     assert set(results.select("left_id", "right_id").iter_rows()) == {
@@ -681,14 +693,19 @@ def test_affected_weighted_score_is_not_counted_twice() -> None:
         ],
         threshold=1,
     )
-    linker.prepare(
-        pl.DataFrame({"id": [1, 2], "key": ["a", "b"], "fallback": ["x", "y"]}),
-        pl.DataFrame({"id": [10, 20], "key": ["a", "b"], "fallback": ["x", "y"]}),
+    baseline_left = pl.DataFrame(
+        {"id": [1, 2], "key": ["a", "b"], "fallback": ["x", "y"]}
     )
+    baseline_right = pl.DataFrame(
+        {"id": [10, 20], "key": ["a", "b"], "fallback": ["x", "y"]}
+    )
+    prepared = linker.prepare(baseline_left, baseline_right)
 
-    results = linker.link(
+    results = prepared.link(
         left=pl.DataFrame({"id": [3], "key": ["a"], "fallback": ["x"]}),
         right=pl.DataFrame({"id": [30], "key": ["a"], "fallback": ["x"]}),
+        baseline_left=baseline_left,
+        baseline_right=baseline_right,
     )
 
     assert set(results.iter_rows()) == {
@@ -703,9 +720,9 @@ def test_affected_empty() -> None:
     linker = DeterministicLinker(comparisons=["l.key = r.key"])
     left = pl.DataFrame({"id": [1], "key": ["a"]})
     right = pl.DataFrame({"id": [10], "key": ["a"]})
-    linker.prepare(left, right)
+    prepared = linker.prepare(left, right)
 
-    results = linker.link(left=left.clear())
+    results = prepared.link(left=left.clear(), baseline_left=left, baseline_right=right)
 
     assert results.is_empty()
     assert results.schema == {

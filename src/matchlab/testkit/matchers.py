@@ -20,7 +20,7 @@ from itertools import combinations
 from typing import ClassVar
 
 import polars as pl
-from pydantic import BaseModel, ConfigDict, PrivateAttr
+from pydantic import BaseModel, ConfigDict
 
 from matchlab.core.hash import HASH_FUNC
 from matchlab.core.schemas import SCHEMA_MODEL_EDGES
@@ -198,17 +198,14 @@ class PerfectDeduper(Deduper):
     version: ClassVar[int] = 1
 
     truth_id: str
-    _baseline: pl.DataFrame | None = PrivateAttr(default=None)
 
-    def prepare(self, data: pl.DataFrame) -> None:
-        """Retain the full input so affected rows can match existing records."""
-        self._baseline = data.clone()
-
-    def dedupe(self, data: pl.DataFrame) -> pl.DataFrame:
+    def dedupe(
+        self, prepared_state: object, data: pl.DataFrame, *, baseline: pl.DataFrame
+    ) -> pl.DataFrame:
         """Emit edges between records sharing a true entity."""
-        if self._baseline is None:
+        if baseline is None:
             raise RuntimeError("Call prepare() before dedupe()")
-        records = pl.concat([self._baseline, data]).unique()
+        records = pl.concat([baseline, data]).unique()
         affected_ids = data["id"].to_list()
         return (
             _ANSWERS[self.truth_id]
@@ -226,28 +223,25 @@ class PerfectLinker(Linker):
     version: ClassVar[int] = 1
 
     truth_id: str
-    _baseline_left: pl.DataFrame | None = PrivateAttr(default=None)
-    _baseline_right: pl.DataFrame | None = PrivateAttr(default=None)
-
-    def prepare(self, left: pl.DataFrame, right: pl.DataFrame) -> None:
-        """Retain both sides for affected-side matching."""
-        self._baseline_left = left.clone()
-        self._baseline_right = right.clone()
 
     def link(
-        self, left: pl.DataFrame | None = None, right: pl.DataFrame | None = None
+        self,
+        prepared_state: object,
+        left: pl.DataFrame | None = None,
+        right: pl.DataFrame | None = None,
+        *,
+        baseline_left: pl.DataFrame,
+        baseline_right: pl.DataFrame,
     ) -> pl.DataFrame:
         """Emit edges involving affected rows without changing the prepared inputs."""
-        if self._baseline_left is None or self._baseline_right is None:
-            raise RuntimeError("Call prepare() before link()")
         if left is None and right is None:
             raise ValueError("Provide at least one affected side to link()")
         answer = _ANSWERS[self.truth_id]
         edges = []
         if left is not None:
-            edges.append(answer.link_edges(left, self._baseline_right))
+            edges.append(answer.link_edges(left, baseline_right))
         if right is not None:
-            edges.append(answer.link_edges(self._baseline_left, right))
+            edges.append(answer.link_edges(baseline_left, right))
         if left is not None and right is not None:
             edges.append(answer.link_edges(left, right))
         return pl.concat(edges).unique(subset=["left_id", "right_id"])

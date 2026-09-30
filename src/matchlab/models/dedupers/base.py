@@ -1,7 +1,7 @@
 """Base class for deduplication methodologies."""
 
 from abc import ABC, abstractmethod
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 import polars as pl
 from pydantic import BaseModel, ConfigDict, Field
@@ -10,7 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field
 class Deduper(BaseModel, ABC):
     """A methodology that finds candidate duplicate pairs within one record step.
 
-    A `Model` step calls `prepare()` with the complete input before `dedupe()`.
+    A `Model` step retains the `PreparedDeduper` returned by `prepare()`.
+    Preparation does not change this specification.
     The action scores pairs involving supplied rows against that prepared input.
     Collection supplies the full input as the affected rows. `dedupe()` returns
     `left_id`, `right_id`, and `score`. `normalise_model_scores` casts the result
@@ -31,12 +32,37 @@ class Deduper(BaseModel, ABC):
         default="id", description="The unique ID field in the data to dedupe"
     )
 
-    @abstractmethod
-    def prepare(self, data: pl.DataFrame) -> None:
-        """Prepare the complete input for later affected-input calls."""
-        ...
+    def prepare(self, data: pl.DataFrame) -> "PreparedDeduper":
+        """Return runtime preparation from the full baseline without changing self.
+
+        Override this to return derived state; the default needs no setup.
+        """
+        return PreparedDeduper(methodology=self)
 
     @abstractmethod
-    def dedupe(self, data: pl.DataFrame) -> pl.DataFrame:
+    def dedupe(
+        self,
+        prepared_state: Any,  # noqa: ANN401 - opaque state owned by the author
+        data: pl.DataFrame,
+        *,
+        baseline: pl.DataFrame,
+    ) -> pl.DataFrame:
         """Score pairs involving `data` against the prepared input."""
         ...
+
+
+class PreparedDeduper(BaseModel):
+    """In-memory preparation for one Deduper, independent of its specification.
+
+    State can contain arbitrary backend objects and need not be serialisable.
+    Baseline data is supplied explicitly to each action by the caller.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
+
+    methodology: Deduper
+    state: Any = None
+
+    def dedupe(self, data: pl.DataFrame, *, baseline: pl.DataFrame) -> pl.DataFrame:
+        """Score supplied rows using this preparation and the explicit baseline."""
+        return self.methodology.dedupe(self.state, data, baseline=baseline)

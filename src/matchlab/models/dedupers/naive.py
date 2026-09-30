@@ -4,7 +4,7 @@ from typing import ClassVar
 
 import duckdb
 import polars as pl
-from pydantic import Field, PrivateAttr
+from pydantic import Field
 
 from matchlab.models.dedupers.base import Deduper
 
@@ -18,19 +18,11 @@ class NaiveDeduper(Deduper):
         description="A list of fields that will form a unique, deduplicated record"
     )
 
-    _baseline: pl.DataFrame | None = PrivateAttr(default=None)
-
-    def prepare(self, data: pl.DataFrame) -> None:
-        """Keep the full input for comparisons with affected records."""
-        self._baseline = data.clone()
-
-    def dedupe(self, data: pl.DataFrame) -> pl.DataFrame:
+    def dedupe(
+        self, prepared_state: object, data: pl.DataFrame, *, baseline: pl.DataFrame
+    ) -> pl.DataFrame:
         """Score pairs involving affected records, with each match scoring 1.0."""
-        if self._baseline is None:
-            raise RuntimeError("Call prepare() before dedupe()")
-
-        id_dtype = self._baseline[self.id].dtype
-        baseline = self._baseline  # noqa: F841
+        id_dtype = baseline[self.id].dtype
         affected = data.clone()  # noqa: F841
 
         join_clause = []

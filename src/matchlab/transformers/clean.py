@@ -39,10 +39,9 @@ class Clean(Transformer):
         reject_id_output(cleaning)
         return cleaning
 
-    def prepare(self, data: pl.DataFrame) -> None:
-        """This transform needs no baseline state."""
-
-    def apply(self, data: pl.DataFrame) -> pl.DataFrame:
+    def apply(
+        self, prepared_state: object, data: pl.DataFrame, *, baseline: pl.DataFrame
+    ) -> pl.DataFrame:
         """Add or replace the named columns, keeping the rest.
 
         Invalid SQL raises at build time, naming the expression.

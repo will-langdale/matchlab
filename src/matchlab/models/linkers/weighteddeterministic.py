@@ -4,7 +4,7 @@ from typing import ClassVar
 
 import duckdb
 import polars as pl
-from pydantic import BaseModel, Field, PrivateAttr, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from matchlab.core.sql import SQLCondition
 from matchlab.models import comparison
@@ -58,30 +58,26 @@ class WeightedDeterministicLinker(Linker):
         le=1,
     )
 
-    _baseline_left: pl.DataFrame | None = PrivateAttr(default=None)
-    _baseline_right: pl.DataFrame | None = PrivateAttr(default=None)
-
-    def prepare(self, left: pl.DataFrame, right: pl.DataFrame) -> None:
-        """Keep both inputs for later affected-side calls."""
-        self._baseline_left = left.clone()
-        self._baseline_right = right.clone()
-
     def link(
-        self, left: pl.DataFrame | None = None, right: pl.DataFrame | None = None
+        self,
+        prepared_state: object,
+        left: pl.DataFrame | None = None,
+        right: pl.DataFrame | None = None,
+        *,
+        baseline_left: pl.DataFrame,
+        baseline_right: pl.DataFrame,
     ) -> pl.DataFrame:
         """Score supplied additions against the baseline and each other.
 
         Keep only pairs scoring at or above `threshold`.
         """
-        if self._baseline_left is None or self._baseline_right is None:
-            raise RuntimeError("Call prepare() before link()")
         if left is None and right is None:
             raise ValueError("Provide at least one affected side to link()")
 
         # Used below but ruff can't detect
-        left_df = _combine_input(self._baseline_left, left)  # noqa: F841
+        left_df = _combine_input(baseline_left, left)  # noqa: F841
         right_df = _combine_input(  # noqa: F841
-            self._baseline_right, right
+            baseline_right, right
         )
 
         match_subquery = []
@@ -131,8 +127,8 @@ class WeightedDeterministicLinker(Linker):
             .pl()
             .with_columns(
                 [
-                    pl.col("left_id").cast(self._baseline_left[self.left_id].dtype),
-                    pl.col("right_id").cast(self._baseline_right[self.right_id].dtype),
+                    pl.col("left_id").cast(baseline_left[self.left_id].dtype),
+                    pl.col("right_id").cast(baseline_right[self.right_id].dtype),
                     pl.col("score").cast(pl.Float32),
                 ]
             )

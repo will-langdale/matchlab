@@ -92,9 +92,9 @@ def test_affected_pairs() -> None:
     deduper = NaiveDeduper(unique_fields=["key"])
     baseline = pl.DataFrame({"id": [1, 2, 4, 5], "key": ["a", "a", "b", "b"]})
     affected = pl.DataFrame({"id": [3, 3, 6, 7, 8], "key": ["a", "a", "a", "c", "c"]})
-    deduper.prepare(baseline)
+    prepared = deduper.prepare(baseline)
 
-    results = deduper.dedupe(affected)
+    results = prepared.dedupe(affected, baseline=baseline)
 
     pairs = {
         frozenset((row["left_id"], row["right_id"])) for row in results.rows(named=True)
@@ -111,21 +111,13 @@ def test_affected_pairs() -> None:
     assert set(results["score"].to_list()) == {1.0}
 
 
-def test_affected_requires_preparation() -> None:
-    """An affected input cannot be scored without a prepared baseline."""
-    deduper = NaiveDeduper(unique_fields=["key"])
-
-    with pytest.raises(RuntimeError, match="prepare"):
-        deduper.dedupe(pl.DataFrame({"id": [1], "key": ["a"]}))
-
-
 def test_affected_empty() -> None:
     """An empty affected input emits no baseline-only pairs."""
     baseline = pl.DataFrame({"id": [1, 2], "key": ["a", "a"]})
     deduper = NaiveDeduper(unique_fields=["key"])
-    deduper.prepare(baseline)
+    prepared = deduper.prepare(baseline)
 
-    results = deduper.dedupe(baseline.clear())
+    results = prepared.dedupe(baseline.clear(), baseline=baseline)
 
     assert results.is_empty()
     assert results.schema == {
